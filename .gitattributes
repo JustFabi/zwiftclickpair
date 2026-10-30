@@ -1,0 +1,24 @@
+# Normalize line endings: LF in the repository.
+* text=auto
+
+# Windows-only scripts must keep CRLF on checkout
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Source / text keeps LF
+*.py text eol=lf
+*.md text eol=lf
+*.php text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.css text eol=lf
+*.js text eol=lf
+*.ts text eol=lf
+*.html text eol=lf
+
+# binaries
+*.png binary
+*.jpg binary
+*.ico binary
+*.exe binary

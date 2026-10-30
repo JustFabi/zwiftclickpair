@@ -1,0 +1,26 @@
+{
+  "name": "ClickBridge",
+  "port": 38393,
+  "control_port": 38398,
+  "host": null,
+  "buttons": {
+    "up": {
+      "actions": [
+        "shift_up"
+      ],
+      "long_press": []
+    },
+    "down": {
+      "actions": [
+        "shift_down"
+      ],
+      "long_press": []
+    }
+  },
+  "long_press_ms": 800,
+  "haptics": true,
+  "click_bits": {},
+  "click_fields": {},
+  "legacy_ecdh": false,
+  "watch": false
+}

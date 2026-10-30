@@ -1,0 +1,210 @@
+# ClickBridge
+
+**Use your Zwift Click (also Zwift Play / Zwift Ride controllers) inside MyWhoosh — for real, with no native Zwift support needed.**
+
+MyWhoosh 5.7+ (April 2026) ships with native support for the open, vendor-neutral
+[OpenBikeControl](https://github.com/OpenBikeControl/openbikecontrol-protocol) protocol
+(MIT-licensed, free to implement). Zwift’s own controllers speak a different proprietary
+channel — so something has to translate. BikeControl is the well-known commercial bridge;
+ClickBridge is a **free, open, local, no-account, no-cloud** translator that you can run on
+this very PC.
+
+```
+                    BLE (Click protocol)                mDNS + TCP (OpenBikeControl)
+   ┌─────────────┐  "RideOn" / keypadds   ┌──────────────┐  _openbikecontrol._tcp   ┌─────────────┐
+   │  Zwift Click │ ─────────────────────▶ │  ClickBridge │ ────────────────────────▶ │   MyWhoosh  │
+   └─────────────┘   button up/down bits   └──────────────┘   0x01 button state frames  └─────────────┘
+                                                          (virtual shifting inside MyWhoosh)
+```
+
+* The Click’s **press and release edges** arrive as-is (no keystroke hacks, no latency tricks)
+  and become OpenBikeControl `Shift Up` / `Shift Down` actions.
+* MyWhoosh can run **on this PC, an iPad, an Apple TV, or a phone** — it only needs to be on
+  the same network as this PC.
+
+---
+
+## Quickstart
+
+1. **Install** (only once): double-click `install.bat` — needs Python 3.12+ from [python.org](https://python.org) (also pre-installed on many systems).
+2. **Run** `run_clickbridge.bat`. Keep the black window open (that *is* the app) while riding.
+3. **Turn the Click on** — press any button so the LED is awake/flashing.
+   Don’t have it connected to the Zwift app or the Zwift Companion app at the same time
+   (it pairs to exactly one device).
+4. In **MyWhoosh**: device/connection screen → **OpenBikeControl icon (top right)** →
+   confirm the **Yes** popup that names `ClickBridge`.
+5. Shift. In the bridge window you’ll see `Shift Up down/up` lines as you press.
+
+### If ClickBridge never appears in MyWhoosh
+
+* Run `firewall.bat` **once as administrator** (allows inbound TCP 38393 + mDNS UDP 5353).
+* Laptop on Wi-Fi with hotspot/router “client isolation”? You need both devices on the same
+  subnet without isolation. On a single PC, loopback works automatically — no firewall needed
+  in practice, but the rule does not hurt.
+* Multi-NIC machine (VPN adapter, Hyper-V/WSL Ethernet)? Force the right interface:
+  `clickbridge --host 192.168.1.42` (see `ipconfig`) and save with `--save-config`.
+
+---
+
+## Control panel (dashboard) — optional
+
+`run_clickbridge.bat` alone is all you need for riding. The Laravel panel adds a web UI:
+
+1. Requirements: **PHP 8.2+ and Composer** (present on this machine; a XAMPP install works fine).
+2. First time only: `cd panel && composer install`.
+3. Just run **`run_panel.bat`** — it starts the bridge and the panel and opens
+   `http://localhost:8080`. From a phone/TV on the same network, open `http://<PC-IP>:8080`
+   instead (allow PHP through the Windows firewall when asked).
+
+What you get:
+
+* **Automatic pairing switch** — the headline feature. **OFF** stops the bridge from scanning
+  for the Click *and* unregisters it from MyWhoosh's discovery; a running session keeps
+  working. **ON** resumes scanning + advertising. (Also on `POST /api/pairing`.)
+* Live status: Click connection state, battery bar, connected trainer apps, mDNS state, mapping.
+* **Event journal** — last 200 events, refreshed ~1.5 s (shift presses, app connects, battery, …).
+* **Disconnect everything** button (drops the Click and all app sessions; auto-pairing
+  reconnects afterwards unless pairing is paused).
+
+Security model: the Python control API binds to **127.0.0.1 only** — nothing else on the
+network can reach it. Browsers go through the Laravel app (standard CSRF protection) at
+`panel/` (`BRIDGE_URL` in `panel/.env`). Laravel 12 requires PHP ≥ 8.2; if you upgrade PHP
+to 8.3+, you may run `composer update` to move to Laravel 13.
+
+---
+
+## The Click quirks you should know about
+
+* **Click v1** (2023, just two buttons): speaks the plain “RideOn” protocol; it should just
+  work. Wake it with a button press first; it stops advertising when asleep or when
+  something else holds its connection.
+* **Click v2** (Cog&Click kit / bundled with trainers,irmware 1.1/1.2): Zwift gates it behind
+  a daily 24-hour “unlock”: without a fresh unlock the **buttons go silent about a minute
+  after connecting** (connection stays perfectly alive!). Two ways around it:
+  1. **Daily 30-second ritual**: open the Zwift app (desktop or mobile, apps other than
+     Companion), log in with a free account (no subscription needed!), go to the device
+     screen, connect the Click, press one of its buttons, wait ~20-30 seconds, close Zwift.
+     Perfect for the rest of the day in ClickBridge + MyWhoosh.
+  2. ClickBridge keeps auto-reconnecting regardless; combined with the shortcut above the
+     experience is: press-up ritual once a day, then shift all day.
+  *Third-party note: BikeControl 6.4+ also offers a “right side only” mode that skips the
+  unlock — that trick depends on their proprietary emulator and cannot be reproduced here.*
+
+---
+
+## Configuration
+
+Default settings live in memory; **config.json** (created by `--save-config`) overrides them.
+
+| Key            | Meaning                                                            |
+|----------------| --------------------------------------------------------------------|
+| `name`         | Device name shown in MyWhoosh’s OpenBikeControl popup (def `ClickBridge`) |
+| `port`         | TCP port (default `38393`)                                          |
+| `host`         | Force mDNS interface IP, else auto                                  |
+| `control_port` | Port of the local control API for the panel (default `38398`, `0` = off). Binds 127.0.0.1 only |
+| `buttons`      | per-physical-button mapping (see below)                             |
+| `long_press_ms`| threshold for the long-press gesture (default 800)                  |
+| `haptics`      | forward app vibration requests to the Click                        |
+| `click_bits`   | remap keypad bitmap bits → logical, if your firmware differs        |
+| `legacy_ecdh`  | use the encrypted legacy handshake (very old firmware)              |
+| `watch`        | raw-frames diagnostics                                             |
+
+Example — make holding `up` do a **U-Turn**, and keep plain shifting on `down`:
+
+```json
+{
+  "buttons": {
+    "up":   { "actions": [],              "long_press": ["uturn"] },
+    "down": { "actions": ["shift_down"],  "long_press": [] }
+  }
+}
+```
+
+More useful actions (any number can be combined per button): `shift_up`, `shift_down`,
+`difficulty_up`, `difficulty_down`, `pause`, `resume`, `lap`, `skip_interval`,
+`previous_interval`, `uturn`, `change_mode`, `take_break`, `emote`, `screenshot`,
+`camera_view`, `hud_toggle`, `map_toggle`, `cruise_control`, powerups (`powerup_1..3`),
+steering (`steer_left`/`steer_right`) and raw ids like `"0x14"`.
+MyWhoosh decides which of them actually do something (its partner integration currently
+supports shifting, steering, camera, nav and a few extras).
+
+Multiple actions per button are supported exactly like the spec suggests, e.g.
+`"actions": ["shift_up", "difficulty_up"]` — apps pick the ones they implement.
+
+---
+
+## Debugging & testing without MyWhoosh
+
+```text
+run_clickbridge.bat --show-devices        # list nearby Zwift controllers (+ --watch for raw)
+run_clickbridge.bat --watch               # verbose: BLE frames, OBC frames, app info
+run_clickbridge.bat --mock                # NO hardware: press u/d in this window instead;
+                                          #   proves MyWhoosh <-> bridge wiring end-to-end
+run_clickbridge.bat --mock --address AA:BB:CC:DD:EE:FF
+python tools\mock_app.py                  # fake MyWhoosh: prints every button event
+python tools\demo_loopback.py             # 10-second self-contained end-to-end demo (no hardware)
+python tests\test_obc_protocol.py         # protocol codec unit tests
+run_clickbridge.bat --selftest            # codec + crypto + TCP loopback checks
+```
+
+Typical first-time sequence on a new machine:
+1. `run_clickbridge.bat --show-devices 10` → find the Click’s address and see its kind.
+2. `run_clickbridge.bat --watch` → confirm it connects (`controller ready`) before opening MyWhoosh.
+3. Open MyWhoosh; watch the bridge log `app mywhoosh ... connected`.
+
+Every command is also reachable through `python -m clickbridge ...` if you prefer.
+
+---
+
+## How the BLE side works (for hackers)
+
+* Discovery: advertising mapper — Zwift’s manufacturer ID `0x094A`, device kind `9` = Click,
+  plus service UUIDs (`00000001-19ca-4651-86e5-fa29dcdd09d1` legacy, `0xFC82` newer).
+* Handshake: write ASCII `RideOn` to the control point characteristic
+  (`00000003-19ca-…`), notifications arrive on the measurement characteristic
+  (`00000002-19ca-…`). Idle heartbeats: `0x15` / `0x19`.
+* The keypad is a protoc­ol-buffer message (id `0x23`) carrying a 32-bit
+  bitmap with **inverse logic** (`1 = released`, `0 = pressed`); bit 2 = up, bit 8 = down on
+  the Click; alternates (`0x200/0x400/0x2000/0x4000`) are mapped generously so both known
+  firmware report styles work. Unknown bits are ignored but logged under `--watch`.
+* Haptics (`0x12 08 0A 06 08 02 10 00 18 <pattern>`), battery (`0x180F`/`2A19`) are wired
+  as bonus niceties.
+* Legacy really-old firmware (pre-2024 encrypted) is supported behind `--legacy-ecdh`
+  (ECDH P-256 + HKDF-SHA256 + AES-CCM reverse-engineered as documented at
+  [makinolo.com](https://www.makinolo.com/blog/2023/10/08/connecting-to-zwift-play-controllers/)).
+
+Key sources on the OpenBikeControl side: [PROTOCOL.md](https://github.com/OpenBikeControl/openbikecontrol-protocol/blob/main/PROTOCOL.md),
+[MDNS.md](…/MDNS.md), [BLE.md](…/BLE.md). ClickBridge’s implementation is carefully aligned
+with the reference `mock_device_tcp.py` example, so it should work with all “Implemented”
+trainer apps (MyWhoosh, TrainingPeaks Virtual, Strappo, Biketerra).
+
+## File map
+
+```
+clickbridge/           the bridge (plain Python, runs standalone)
+  __main__.py          CLI, orchestrator, mock mode, selftest
+  clickdevice.py       BLE discovery + Click protocol decoding
+  obc_server.py        OpenBikeControl mDNS + TCP device
+  obc.py               OBC binary codec + action table
+  zwiftcrypt.py        legacy encrypted handshake math
+  control_api.py       localhost status/control API for the panel
+panel/                 Laravel 12 web control panel (optional)
+  app/Http/Controllers/BridgeController.php
+  resources/views/dashboard.blade.php
+tools/mock_app.py      fake trainer app for live testing
+tools/demo_loopback.py 10-second end-to-end demo, no hardware
+tests/                 protocol tests
+install.bat / run_clickbridge.bat / run_panel.bat / firewall.bat
+```
+
+Hackers' cheat sheet — the control API (bridge must be running):
+
+```text
+curl http://127.0.0.1:38398/api/status                  # full JSON state + events
+curl -X POST -d "{\"enabled\":false}" -H "Content-Type: application/json" \
+     http://127.0.0.1:38398/api/pairing                  # stop automatic pairing
+curl -X POST http://127.0.0.1:38398/api/disconnect       # drop Click + app sessions
+```
+
+Licensed MIT. No network egress, no telemetry, no cloud — everything stays between the
+Click, this PC, and your trainer app.

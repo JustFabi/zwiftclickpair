@@ -1,0 +1,27 @@
+# --- Python (bridge core) ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# --- personal bridge config (created by --save-config) ---
+/config.json
+
+# --- Laravel intend: covered by panel/.gitignore, extra safety here ---
+panel/vendor/
+panel/node_modules/
+panel/.env
+panel/public/build/
+panel/public/hot/
+panel/storage/*.key
+panel/storage/pail/
+
+# --- OS/editor junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+.idea/
+.vscode/
