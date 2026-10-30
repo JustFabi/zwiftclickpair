@@ -5,6 +5,9 @@
 *.bat text eol=crlf
 *.cmd text eol=crlf
 
+# Linux scripts keep LF everywhere
+*.sh text eol=lf
+
 # Source / text keeps LF
 *.py text eol=lf
 *.md text eol=lf

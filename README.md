@@ -46,6 +46,30 @@ this very PC.
 
 ---
 
+## Raspberry Pi / Linux quickstart (this machine)
+
+1. `./install.sh` — virtualenv + Python deps, panel deps (composer, app key, sqlite migrate).
+2. `sudo ./setup_vhost.sh` — unblocks Bluetooth, installs + starts both systemd units and
+   the Apache vhost.
+3. After that everything survives reboots:
+   * Bridge → systemd unit `clickbridge` (logs: `journalctl -u clickbridge -f`)
+   * Panel → Apache vhost **http://clickbridge.local** (alias `zwiftclickpair.local`),
+     published on the LAN via the `clickbridge-alias` unit (`avahi-publish`).
+     If you skip step 2 on a non-Apache box: `./run_clickbridge.sh` in one terminal and
+     `./run_panel.sh` for the `php artisan serve` panel at `http://localhost:8080`.
+4. Firewall: Debian ships with no filtering enabled by default. If you run `ufw`:
+   `sudo ufw allow 38393/tcp && sudo ufw allow 5353/udp`.
+5. Debug commands from the Windows quickstart work the same way, e.g.
+   `./run_clickbridge.sh --show-devices`.
+
+Gotchas specific to the Pi:
+* Bluetooth must not be rfkill-soft-blocked (`rfkill list` → `Soft blocked: no`).
+* The mDNS alias names are published with `avahi-publish` — do **not** use
+  `/etc/avahi/hosts` for this: entries sharing the machine's own address collide on the
+  reverse lookup (`Local name collision`) and get dropped on every avahi restart.
+
+---
+
 ## Control panel (dashboard) — optional
 
 `run_clickbridge.bat` alone is all you need for riding. The Laravel panel adds a web UI:
@@ -194,7 +218,10 @@ panel/                 Laravel 12 web control panel (optional)
 tools/mock_app.py      fake trainer app for live testing
 tools/demo_loopback.py 10-second end-to-end demo, no hardware
 tests/                 protocol tests
-install.bat / run_clickbridge.bat / run_panel.bat / firewall.bat
+install.bat / run_clickbridge.bat / run_panel.bat / firewall.bat (Windows)
+install.sh / run_clickbridge.sh / run_panel.sh / setup_vhost.sh (Linux / Raspberry Pi)
+clickbridge.service / clickbridge-alias.service / publish_aliases.sh / zwiftclickpair.conf
+  (systemd units + Apache vhost template, installed by setup_vhost.sh)
 ```
 
 Hackers' cheat sheet — the control API (bridge must be running):

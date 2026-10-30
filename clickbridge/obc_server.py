@@ -228,7 +228,6 @@ class ObcServer:
             "model": "Zwift Click -> OpenBikeControl bridge",
         }
         kwargs = dict(
-            type_=MDNS_SERVICE_TYPE,
             port=self.port,
             properties=props,
             server=f"{socket.gethostname().split('.')[0]}.local.",

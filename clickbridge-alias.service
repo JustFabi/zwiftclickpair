@@ -1,0 +1,13 @@
+[Unit]
+Description=ClickBridge: publish panel .local aliases via avahi
+Wants=network-online.target avahi-daemon.service
+After=network-online.target avahi-daemon.service
+
+[Service]
+Type=simple
+ExecStart=/var/www/zwiftclickpair/publish_aliases.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

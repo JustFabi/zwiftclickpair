@@ -1,0 +1,19 @@
+[Unit]
+Description=ClickBridge: Zwift Click -> OpenBikeControl bridge
+Documentation=https://github.com/fabianmerkl/zwiftclickpair
+Wants=network-online.target
+After=network-online.target bluetooth.service
+
+[Service]
+Type=simple
+WorkingDirectory=/var/www/zwiftclickpair
+ExecStart=/var/www/zwiftclickpair/.venv/bin/python -m clickbridge
+# Root: BLE (BlueZ D-Bus) + mDNS (UDP 5353) need privileges on most distros.
+User=root
+Restart=always
+RestartSec=3
+# TCP 38393 is public, everything else stays local.
+NoNewPrivileges=no
+
+[Install]
+WantedBy=multi-user.target
