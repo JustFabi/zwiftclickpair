@@ -33,7 +33,7 @@ this very PC.
    (it pairs to exactly one device).
 4. In **MyWhoosh**: device/connection screen → **OpenBikeControl icon (top right)** →
    confirm the **Yes** popup that names `ClickBridge`.
-5. Shift. In the bridge window you’ll see `Shift Up down/up` lines as you press.
+5. Shift. In the bridge window you’ll see `Shift Up pressed` lines as you press.
 
 ### If ClickBridge never appears in MyWhoosh
 
@@ -132,7 +132,7 @@ Default settings live in memory; **config.json** (created by `--save-config`) ov
 | `buttons`      | per-physical-button mapping (see below)                             |
 | `long_press_ms`| threshold for the long-press gesture (default 800)                  |
 | `haptics`      | forward app vibration requests to the Click                        |
-| `click_bits`   | remap keypad bitmap bits → logical, if your firmware differs        |
+| `click_bits`   | remap keypad bitmap bits (VALUES: 2, 8, 256, 4096 …) → logical, if your firmware differs |
 | `legacy_ecdh`  | use the encrypted legacy handshake (very old firmware)              |
 | `watch`        | raw-frames diagnostics                                             |
 
@@ -190,10 +190,28 @@ Every command is also reachable through `python -m clickbridge ...` if you prefe
 * Handshake: write ASCII `RideOn` to the control point characteristic
   (`00000003-19ca-…`), notifications arrive on the measurement characteristic
   (`00000002-19ca-…`). Idle heartbeats: `0x15` / `0x19`.
-* The keypad is a protoc­ol-buffer message (id `0x23`) carrying a 32-bit
-  bitmap with **inverse logic** (`1 = released`, `0 = pressed`); bit 2 = up, bit 8 = down on
-  the Click; alternates (`0x200/0x400/0x2000/0x4000`) are mapped generously so both known
-  firmware report styles work. Unknown bits are ignored but logged under `--watch`.
+* The keypad is a protocol-buffer message (id `0x23`) carrying a 32-bit
+  bitmap with **inverse logic** (`1 = released`, `0 = pressed`), verified
+  against hardware captures ([MarcelCode's protocol doc](https://github.com/MarcelCode/zwift-play-remote/blob/main/docs/protocol.md),
+  SwiftControl's decoded map and our own live capture from a Click v2 pair):
+  bit `0x1` left, `0x2` up, `0x4` right, `0x8` down, `0x10` A, `0x20` B,
+  `0x40` Y, `0x80` Z, `0x100` shifter L (pressed), `0x200` shifter-L alt,
+  `0x400` power-up L, `0x800` on/off L, `0x1000` shifter R,
+  `0x2000` shifter-R alt, `0x4000` power-up R, `0x8000` on/off R.
+  Final proof from the live wire: pressing the left pod's shift-down button
+  yields bitmap `fffffeff` (bit `0x100`), pressing the right pod's
+  shift-up button yields `ffffefff` (bit `0x1000`).
+  Defaults per generation: on a **Click v2 pair** (new Zwift Cog kit) the
+  LEFT pod's shifters (`0x100/0x200`) shift **down** and the RIGHT pod's
+  (`0x1000/0x2000`) shift **up** — Zwift's own Cog semantics (left pod =
+  shift down, right pod = shift up, matching what the game itself does) —
+  the D-pad navigates, A selects, B backs, Y fires a power-up and Z
+  brakes; an **original Click v1** shifts with its two buttons (older
+  firmware reports them on bits `0x2/0x8`, firmware 1.1.0+ sends the
+  `0x37` protobuf message instead). Both halves of a v2 pair reinforce
+  each other's presses on the bus — the bridge merges them so one
+  physical press stays one press. Remap anything via `click_bits`
+  (keys are the bit values above).
 * Haptics (`0x12 08 0A 06 08 02 10 00 18 <pattern>`), battery (`0x180F`/`2A19`) are wired
   as bonus niceties.
 * Legacy really-old firmware (pre-2024 encrypted) is supported behind `--legacy-ecdh`

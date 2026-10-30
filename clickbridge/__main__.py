@@ -46,10 +46,29 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # "actions" fire on press (released automatically at release time);
     # "long_press" fires as a quick tap on RELEASE when held >= long_press_ms.
     # Set "actions": [] to make a dedicated gesture button.
+    # "up"/"down" cover the shifters: on a Click v2 pair the LEFT pod's
+    # shifter emits "down" and the RIGHT pod's emits "up" (Cog semantics),
+    # matching the original Click's +/- buttons.  "nav_*"/"a"/"b"/"y"/"z"
+    # cover the Click v2 / Ride button set (Zwift game semantics: D-pad
+    # navigates, A selects, B goes back, Y fires a power-up, Z brakes).
     "buttons": {
         "up": {"actions": ["shift_up"], "long_press": []},
         "down": {"actions": ["shift_down"], "long_press": []},
+        "nav_up": {"actions": ["up"], "long_press": []},
+        "nav_down": {"actions": ["down"], "long_press": []},
+        "nav_left": {"actions": ["left"], "long_press": []},
+        "nav_right": {"actions": ["right"], "long_press": []},
+        "a": {"actions": ["select"], "long_press": []},
+        "b": {"actions": ["back"], "long_press": []},
+        "y": {"actions": ["powerup_1"], "long_press": []},
+        "z": {"actions": ["brake"], "long_press": []},
     },
+    # Controller addresses to pair with. Empty = pair with every Zwift
+    # controller discovered nearby (a Zwift Ride / Click-v2 pair has two);
+    # set one or more addresses to bind to specific physical units.
+    "addresses": [],
+    # Safety cap for automatic discovery.
+    "max_clicks": 4,
     "long_press_ms": 800,
     # Forward app haptic requests to the Click's vibration motor.
     "haptics": True,
@@ -183,8 +202,8 @@ class MockClick:
         self._tap(logical)
 
     def _tap(self, logical: str) -> None:
-        self.bridge._on_click_action(logical, True, 0)
-        release = lambda: self.bridge._on_click_action(logical, False, 0)
+        self.bridge._on_click_action("mock", logical, True, 0)
+        release = lambda: self.bridge._on_click_action("mock", logical, False, 0)
         self._loop.call_later(0.12, release)
 
     async def _auto_cycle(self) -> None:
@@ -214,7 +233,11 @@ class Bridge:
             on_app_info=self._on_app_info,
             on_haptic=self._on_haptic,
         )
-        self._click: ZwiftClick | MockClick | None = None
+        self._click: MockClick | None = None          # mock mode only
+        self._clicks: dict[str, ZwiftClick] = {}      # real controllers, by address
+        self._click_tasks: dict[str, asyncio.Task] = {}
+        self.max_clicks = max(1, int(cfg.get("max_clicks", 4) or 4))
+        self.addresses = [a.upper() for a in (cfg.get("addresses") or []) if str(a).strip()]
         self._active: set[int] = set()
         self._press_at: dict[str, float] = {}
         self._unmapped_warned: set[str] = set()
@@ -240,7 +263,14 @@ class Bridge:
         return bool(self.cfg.get("watch"))
 
     # ---------------------------------------------------------- construction
-    def _build_click(self) -> ZwiftClick:
+    def _spawn_click(self, address: str, *, kind_id: int | None = None) -> ZwiftClick:
+        """Create (or return) the bridge connection for one controller."""
+        address = address.upper()
+        if address in self._clicks:
+            return self._clicks[address]
+        if len(self._clicks) >= self.max_clicks:
+            return None
+
         def int_map(spec) -> dict[int, str]:
             out = {}
             for key, value in (spec or {}).items():
@@ -250,41 +280,71 @@ class Bridge:
                     log.error("config mapping key must be an int: %r", key)
             return out
 
-        return ZwiftClick(
-            address=self.cfg.get("address"),
+        unit = address.replace(":", "").lower()[-4:]
+
+        def partial(fn, *bound):  # forward with unit tag as first positional
+            return lambda *args, _fn=fn, _b=bound: _fn(*(_b + args))
+
+        click = ZwiftClick(
+            address=address,
+            kind_id=kind_id,
             watch=self._watch(),
             legacy_ecdh=bool(self.cfg.get("legacy_ecdh")),
             bit_actions=int_map(self.cfg.get("click_bits")),
             field_actions=int_map(self.cfg.get("click_fields")),
-            on_action=self._on_click_action,
-            on_ready=self._on_click_ready,
-            on_gone=self._on_click_gone,
-            on_battery=self._on_click_battery,
+            on_action=partial(self._on_click_action, unit),
+            on_ready=partial(self._on_click_ready, unit),
+            on_gone=partial(self._on_click_gone, unit),
+            on_battery=partial(self._on_click_battery, unit),
         )
+        self._clicks[address] = click
+        log.info("new controller candidate %s (%s) -- pairing ...", address, unit)
+        self.record("click", f"controller seen ({unit}) -- pairing ...")
+        self._click_tasks[address] = asyncio.create_task(
+            self._run_click(click), name=f"click-{unit}")
+        return click
+
+    async def _run_click(self, click: ZwiftClick) -> None:
+        try:
+            task = click.start()
+            await task
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.error("controller %s crashed: %r", click.address, exc)
+        finally:
+            if click.address:
+                self._click_tasks.pop(click.address, None)
 
     # ------------------------------------------------- callbacks (click ->)
-    def _on_click_ready(self, label: str) -> None:
+    def _on_click_ready(self, unit: str, label: str) -> None:
         self.server.click_connected = True
         self.server.click_label = label
-        self.record("click", f"controller ready: {label}")
+        self.record("click", f"controller ready: {label} ({unit})")
+        asyncio.create_task(self.server.push_status())
 
-    def _on_click_gone(self) -> None:
-        self.server.click_connected = False
-        self.record("click", "controller disconnected")
+    def _on_click_gone(self, unit: str) -> None:
+        remaining = [c for c in self._clicks.values() if c.connected]
+        if remaining:
+            self.server.click_connected = True
+            self.server.click_label = remaining[0].device_label
+        else:
+            self.server.click_connected = False
+        self.record("click", f"controller disconnected ({unit})")
         dangling = sorted(self._active)
         self._active.clear()
         if dangling:
             asyncio.create_task(
                 self.server.broadcast_buttons([(a, 0x00) for a in dangling])
             )
-            asyncio.create_task(self.server.push_status())
-
-    def _on_click_battery(self, level: int | None) -> None:
-        self.server.battery = level
-        self.record("battery", "?" if level is None else f"battery {level}%")
         asyncio.create_task(self.server.push_status())
 
-    def _on_click_action(self, logical: str, pressed: bool, source: int) -> None:
+    def _on_click_battery(self, unit: str, level: int | None) -> None:
+        self.server.battery = level
+        self.record("battery", "?" if level is None else f"battery {level}% ({unit})")
+        asyncio.create_task(self.server.push_status())
+
+    def _on_click_action(self, unit: str, logical: str, pressed: bool, source: int) -> None:
         if self._watch():
             log.debug("click event: %s %s (code %d)",
                       logical, "press" if pressed else "release", source)
@@ -304,26 +364,33 @@ class Bridge:
             ids = [a for a in short_actions if a not in self._active]
             if ids:
                 self._active.update(ids)
-                asyncio.create_task(self._broadcast([(a, 0x01) for a in ids]))
+                asyncio.create_task(self._broadcast([(a, 0x01) for a in ids],
+                                                    record_event=True))
             return
         held_ms = (now - self._press_at.get(logical, now)) * 1000.0
         release_ids = [a for a in sorted(self._active) if a in short_actions]
         for a in release_ids:
             self._active.discard(a)
         if release_ids:
-            asyncio.create_task(self._broadcast([(a, 0x00) for a in release_ids]))
+            asyncio.create_task(self._broadcast([(a, 0x00) for a in release_ids],
+                                                record_event=False))
         if long_actions and held_ms >= self.long_press_ms:
             asyncio.create_task(self._long_press_tap(long_actions))
 
-    async def _broadcast(self, pairs: list[tuple[int, int]]) -> None:
+    async def _broadcast(self, pairs: list[tuple[int, int]],
+                         *, record_event: bool = True) -> None:
         if not pairs:
             return
         await self.server.broadcast_buttons(pairs)
+        # OBC button-state is a *state* channel: apps need the press AND the
+        # release transition, but the journal stays clean with one line per
+        # physical press.
         pretty = ", ".join(
-            f"{obc.action_name(a)} {'down' if s else 'up'}" for a, s in pairs
+            f"{obc.action_name(a)} {'pressed' if s else 'released'}" for a, s in pairs
         )
         log.info("-> %s", pretty)
-        self.record("shift", pretty)
+        if record_event:
+            self.record("shift", pretty)
 
     async def _long_press_tap(self, ids: list[int]) -> None:
         log.info("-> long-press tap: %s", ", ".join(obc.action_name(a) for a in ids))
@@ -348,11 +415,15 @@ class Bridge:
             self.record("app", "trainer app connected")
 
     def _on_haptic(self, pattern: int, duration: int, intensity: int) -> None:
-        if not self.haptics or self._click is None:
+        if not self.haptics:
             return
         # Only forward the plain, safe vibration patterns.
         zwift_pattern = {1: 2, 2: 3, 3: 4}.get(pattern, 2)
-        self._click.request_haptic(zwift_pattern)
+        sent = False
+        for click in list(self._clicks.values()):
+            sent = click.request_haptic(zwift_pattern) or sent
+        if self._click is not None:
+            self._click.request_haptic(zwift_pattern)
 
     # ------------------------------------------------- control panel hooks
     async def set_pairing(self, enabled: bool) -> None:
@@ -376,6 +447,8 @@ class Bridge:
         click = self._click
         if click is not None and hasattr(click, "set_pairing"):
             click.set_pairing(enabled)
+        for click in self._clicks.values():
+            click.set_pairing(enabled)
         want_mdns = enabled and not bool(self.cfg.get("no_mdns"))
         try:
             await self.server.set_advertising(want_mdns)
@@ -392,12 +465,56 @@ class Bridge:
                 await click.disconnect()
             except Exception:
                 pass
+        for click in list(self._clicks.values()):
+            try:
+                await click.disconnect()
+            except Exception:
+                pass
         await self.server.close_sessions()
 
     def snapshot(self) -> dict:
         """Full dashboard state; served by the control API."""
-        click = self._click
         cfg = self.cfg
+        clicks = sorted(self._clicks.values(), key=lambda c: c.address or "")
+        clicks_view = [
+            {
+                "address": c.address,
+                "connected": bool(c.connected),
+                "label": getattr(c, "device_label", "?"),
+                "protocol": getattr(c, "protocol", None),
+                "battery": getattr(c, "battery", None),
+            }
+            for c in clicks
+        ]
+        connected = [c for c in clicks if c.connected]
+        if self._click is not None:  # mock mode
+            click = {
+                "connected": bool(getattr(self._click, "connected", False)),
+                "label": getattr(self._click, "device_label", "?"),
+                "protocol": getattr(self._click, "protocol", None),
+                "battery": getattr(self._click, "battery", None),
+                "count": int(bool(getattr(self._click, "connected", False))),
+                "total": 1,
+            }
+            clicks_view = [{
+                "address": "mock", "connected": bool(getattr(self._click, "connected", False)),
+                "label": getattr(self._click, "device_label", "?"),
+                "protocol": getattr(self._click, "protocol", None),
+                "battery": getattr(self._click, "battery", None),
+            }]
+        else:
+            battery = next((c.battery for c in connected if c.battery is not None), None)
+            label = (", ".join(f"{c.device_label} ({c.address.replace(':', '').lower()[-4:]})"
+                               for c in connected) if connected else
+                     (", ".join(c.device_label for c in clicks) if clicks else "?"))
+            click = {
+                "connected": bool(connected),
+                "label": label,
+                "protocol": next((c.protocol for c in connected if c.protocol), None),
+                "battery": battery,
+                "count": len(connected),
+                "total": len(clicks),
+            }
         buttons_pretty = {
             logical: {
                 "press": [obc.action_name(a) for a in short],
@@ -412,12 +529,8 @@ class Bridge:
             "pairing_enabled": self.pairing_enabled,
             "mdns_advertising": getattr(self.server, "_info", None) is not None,
             "control_port": self.control_api.port if self.control_api else 0,
-            "click": {
-                "connected": bool(getattr(click, "connected", False)),
-                "label": getattr(click, "device_label", "?"),
-                "protocol": getattr(click, "protocol", None),
-                "battery": getattr(click, "battery", None),
-            },
+            "click": click,
+            "clicks": clicks_view,
             "apps": {
                 "count": len(self.server.sessions),
                 "ids": self.server.app_ids(),
@@ -434,14 +547,57 @@ class Bridge:
         }
 
     # ------------------------------------------------------------- runtime
+    async def _supervise_pairing(self) -> None:
+        """Keeps one ZwiftClick alive per controller.
+
+        Pinned addresses (config 'addresses') are spawned immediately; in
+        automatic mode every newly discovered controller joins up to
+        'max_clicks'.  Existing sessions keep running while pairing is
+        paused (control panel switch), new ones just stop appearing.
+        """
+        from .clickdevice import discover_controllers
+
+        log.info("pairing supervisor: %s",
+                 ("pinned addresses " + ", ".join(self.addresses))
+                 if self.addresses else "automatic discovery (max %d)" % self.max_clicks)
+        for addr in self.addresses:
+            self._spawn_click(addr)
+            await asyncio.sleep(2.0)  # stagger direct connects
+        while not self._stopped.is_set():
+            clicks = list(self._clicks.values())
+            if (self.pairing_enabled and not self.addresses
+                    and (not clicks or any(not c.connected for c in clicks))):
+                # A connected controller never advertises; scanning while all
+                # managed clicks hold sessions only burns radio + D-Bus time
+                # and has been seen to destabilise concurrent connections.
+                try:
+                    candidates = await discover_controllers(timeout=4.0)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.debug("controller discovery failed: %r", exc)
+                    candidates = []
+                for dev, _adv, info in candidates:
+                    if len(self._clicks) >= self.max_clicks:
+                        break
+                    self._spawn_click(dev.address.upper(),
+                                      kind_id=info.get("kind_id"))
+            await asyncio.sleep(7.0)
+
     async def run(self, *, mock: MockClick | None = None) -> None:
-        click: ZwiftClick | MockClick = mock if mock is not None else self._build_click()
-        self._click = click
         await self.server.start()
         self.loop = asyncio.get_running_loop()
         self.control_api = ControlApi(self, int(self.cfg.get("control_port") or 0))
         self.control_api.start()
-        click_task = click.start()
+        if mock is not None:
+            self._click = mock
+            click_task = mock.start()
+        else:
+            from .clickdevice import disconnect_stale
+            with contextlib.suppress(Exception):
+                await disconnect_stale()
+            click_task = asyncio.create_task(
+                self._supervise_pairing(), name="pairing-supervisor")
         status_task = asyncio.create_task(self._status_loop(), name="status")
         if mock is None:
             print("Bridge is running.  Waiting for the Click and for MyWhoosh "
@@ -453,9 +609,9 @@ class Bridge:
         try:
             await self._stopped.wait()
         finally:
-            await self._teardown(click, click_task, status_task)
+            await self._teardown(click_task, status_task)
 
-    async def _teardown(self, click, click_task, status_task) -> None:
+    async def _teardown(self, click_task, status_task) -> None:
         suppress = contextlib.suppress
         if self.control_api is not None:
             with suppress(Exception):
@@ -464,12 +620,19 @@ class Bridge:
         try:
             click_task.cancel()
             status_task.cancel()
+            for click in list(self._clicks.values()):
+                with suppress(Exception):
+                    await click.stop()
+            for task in list(self._click_tasks.values()):
+                task.cancel()
+            if self._click is not None:
+                with suppress(Exception):
+                    await self._click.stop()
+            tasks = [click_task, status_task, *self._click_tasks.values()]
             with suppress(asyncio.CancelledError, Exception):
-                await click.stop()
+                await asyncio.gather(*tasks, return_exceptions=True)
             with suppress(asyncio.CancelledError, Exception):
                 await self.server.stop()
-            with suppress(asyncio.CancelledError, Exception):
-                await asyncio.gather(click_task, status_task, return_exceptions=True)
         except BaseException:  # during interpreter shutdown / Ctrl+C sweeps
             pass
         log.info("bridge closed")

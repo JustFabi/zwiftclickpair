@@ -4,18 +4,16 @@
   "control_port": 38398,
   "host": null,
   "buttons": {
-    "up": {
-      "actions": [
-        "shift_up"
-      ],
-      "long_press": []
-    },
-    "down": {
-      "actions": [
-        "shift_down"
-      ],
-      "long_press": []
-    }
+    "up": {"actions": ["shift_up"], "long_press": []},
+    "down": {"actions": ["shift_down"], "long_press": []},
+    "nav_up": {"actions": ["up"], "long_press": []},
+    "nav_down": {"actions": ["down"], "long_press": []},
+    "nav_left": {"actions": ["left"], "long_press": []},
+    "nav_right": {"actions": ["right"], "long_press": []},
+    "a": {"actions": ["select"], "long_press": []},
+    "b": {"actions": ["back"], "long_press": []},
+    "y": {"actions": ["powerup_1"], "long_press": []},
+    "z": {"actions": ["brake"], "long_press": []}
   },
   "long_press_ms": 800,
   "haptics": true,

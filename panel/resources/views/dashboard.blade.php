@@ -115,6 +115,7 @@ footer code{color:#9aa5b1;background:#1a2230;padding:1px 6px;border-radius:6px}
       <div class="row"><span class="k">Protocol</span><span class="v" id="click-proto">…</span></div>
       <div class="row"><span class="k">Battery</span><span class="v" id="click-batt">…</span></div>
       <div class="battery" id="batt-bar"><i style="width:0%"></i></div>
+      <div id="click-units" style="margin-top:10px"></div>
     </div>
 
     <div class="card">
@@ -197,6 +198,7 @@ async function refresh(){
     $('click-proto').textContent = '—';
     $('click-batt').textContent = '—';
     $('batt-bar').firstElementChild.style.width = '0%';
+    $('click-units').innerHTML = '';
     $('app-count').textContent = '—';
     $('app-ids').textContent = '—';
     $('mapping').innerHTML = '<span style="color:var(--warn)">ClickBridge is not running — start it with run_clickbridge.bat (or run_panel.bat) and this panel comes back automatically.</span>';
@@ -224,11 +226,32 @@ async function refresh(){
     $('batt-bar').firstElementChild.style.width = click.battery + '%';
   }
 
+  let unitsHtml = '';
+  for (const c of (st.clicks || [])){
+    const dot = c.connected ? '<span class="dot ok"></span>yes'
+                            : '<span class="dot bad"></span>no';
+    unitsHtml += '<div class="row"><span class="k">' + esc(String(c.address || '?').toLowerCase())
+      + '</span><span class="v">' + dot + '</span></div>';
+  }
+  unitsHtml = '<div style="color:var(--dim);font-size:12px;margin-bottom:4px">each controller</div>' + unitsHtml;
+  $('click-units').innerHTML = unitsHtml;
+
   $('app-count').textContent = st.apps.count;
   $('app-ids').innerHTML = (st.apps.ids && st.apps.ids.length)
     ? st.apps.ids.map(esc).join(' ') : '<span style="color:var(--dim)">none (connect via the OpenBikeControl icon in the app)</span>';
   $('obc-port').textContent = st.config.obc_port;
   $('mdns').textContent = st.mdns_advertising ? 'advertising' : 'hidden';
+
+  const BTN_LABELS = {
+    'up': 'Shifter up (+)', 'down': 'Shifter down (−)',
+    'nav_up': 'D-pad up', 'nav_down': 'D-pad down',
+    'nav_left': 'D-pad left', 'nav_right': 'D-pad right',
+    'a': 'A button', 'b': 'B button', 'y': 'Y button', 'z': 'Z button'
+  };
+  function btnLabel(name){
+    if (BTN_LABELS[name]) return BTN_LABELS[name];
+    return name.replace(/_/g, ' ');
+  }
 
   const m = st.config.buttons;
   let html = '';
@@ -236,7 +259,7 @@ async function refresh(){
     const parts = [];
     if (m[btn].press.length) parts.push('<b>' + esc(m[btn].press.join(' + ')) + '</b>');
     if (m[btn].long_press.length) parts.push('hold ≥ ' + st.config.long_press_ms + 'ms: <b>' + esc(m[btn].long_press.join(' + ')) + '</b>');
-    html += '<div class="row"><span class="k">' + esc(btn) + '</span><span class="v">' + parts.join(' · ') + '</span></div>';
+    html += '<div class="row"><span class="k">' + esc(btnLabel(btn)) + '</span><span class="v">' + parts.join(' · ') + '</span></div>';
   }
   html += '<div class="row"><span class="k">Haptics</span><span class="v">' + (st.config.haptics ? 'forwarded to Click' : 'off') + '</span></div>';
   $('mapping').innerHTML = html;

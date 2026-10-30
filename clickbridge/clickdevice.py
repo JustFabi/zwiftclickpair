@@ -10,9 +10,12 @@ Two firmware generations exist on Zwift hardware and both are handled:
   ``--legacy-ecdh`` (see zwiftcrypt.py).  Payloads decode identically once
   decrypted.
 
-The controller reports a 32-bit keypad bitmap (inverse logic); this module
-maps the relevant bits onto logical action names ("up", "down", ...) which
-the orchestrator translates into OpenBikeControl actions.
+The keypad arrives either as a 32-bit bitmap message (0x23, inverse logic)
+or -- original Click v1 -- as a small protobuf message (0x37, fields for
+Plus/Minus, active-low); Play-era hardware (0x07) uses protobuf fields too.
+This module maps those inputs onto logical action names ("up", "down",
+"nav_up", ...) which the orchestrator translates into OpenBikeControl
+actions.
 """
 
 from __future__ import annotations
@@ -45,45 +48,86 @@ DEVICE_KINDS = {
     7: "Zwift Ride (right)",
     8: "Zwift Ride (left)",
     9: "Zwift Click",
+    10: "Zwift Click v2 (right)",   # 0x0A, confirmed on hardware
+    11: "Zwift Click v2 (left)",    # 0x0B, confirmed on hardware
+    14: "Zwift Play (firmware 2.x)",  # 0x0E: Play speaking the Ride protocol
 }
 
 KIND_PREFERENCE = {
     "Zwift Click": 0,
+    "Zwift Click v2 (left)": 0,
+    "Zwift Click v2 (right)": 0,
     "Zwift Ride (left)": 1,
     "Zwift Ride (right)": 1,
     "Zwift Play (left)": 2,
     "Zwift Play (right)": 2,
+    "Zwift Play (firmware 2.x)": 2,
 }
 
 # 32-bit keypad bitmap, inverse logic (bit cleared == pressed).
+# Bit table matching SwiftControl's maintained decode of the "0x23" keypad
+# message and confirmed against our own Click v2 wire capture: 0x1 left,
+# 0x2 up, 0x4 right, 0x8 down, 0x10 A, 0x20 B, 0x40 Y, 0x80 Z, then
+# per-half shifter / power-up / on-off bits.
 BIT_NAMES: dict[int, str] = {
-    0x00001: "left",
-    0x00002: "up",
-    0x00004: "right",
-    0x00008: "down",
+    0x00001: "dpad_left",
+    0x00002: "dpad_up",
+    0x00004: "dpad_right",
+    0x00008: "dpad_down",
     0x00010: "A",
     0x00020: "B",
     0x00040: "Y",
-    0x00100: "Z",
-    0x00200: "shift_up_left",
-    0x00400: "shift_down_left",
-    0x00800: "powerup_left",
-    0x01000: "power_left",
-    0x02000: "shift_up_right",
-    0x04000: "shift_down_right",
-    0x10000: "powerup_right",
-    0x20000: "power_right",
+    0x00080: "Z",
+    0x00100: "shifter_left",     # left pod shifter (Cog kit: shifts DOWN)
+    0x00200: "shifter_left_2",   # left pod's second shift position
+    0x00400: "powerup_left",
+    0x00800: "onoff_left",
+    0x01000: "shifter_right",    # right pod shifter (shifts UP)
+    0x02000: "shifter_right_2",  # right pod's second shift position
+    0x04000: "powerup_right",
+    0x08000: "onoff_right",
 }
 
-# Which physical bits mean what for a Click (arrow/paddle positions).
-DEFAULT_BIT_ACTIONS: dict[int, str] = {
-    0x0002: "up",
-    0x0008: "down",
-    0x0200: "up",
-    0x0400: "down",
-    0x2000: "up",
-    0x4000: "down",
+# Keypad-bit -> bridge-logical defaults, keyed by bit VALUE.
+#
+# Click v2 (Cog kit) / Ride gen: all "0x23" bitmap hardware.  One shift
+# button per pod (two wire positions), verified from hardware captures:
+# bit `0x100` = the left pod's shifter, bit `0x1000` = the right pod's.
+# Zwift's own Cog semantics: LEFT pod shifts DOWN, RIGHT pod shifts UP
+# (SwiftControl maps every left-side shifter button to shiftDown and every
+# right-side one to shiftUp).  D-pad navigates, A selects, B backs,
+# Y fires a power-up, Z brakes; power-up/on-off slots left unbound.
+V2_DEFAULT_BIT_ACTIONS: dict[int, str] = {
+    0x0100: "down", 0x0200: "down",            # left pod shifters -> DOWN
+    0x1000: "up", 0x2000: "up",                # right pod shifters -> UP
+    0x0001: "nav_left", 0x0002: "nav_up",
+    0x0004: "nav_right", 0x0008: "nav_down",
+    0x0010: "a", 0x0020: "b", 0x0040: "y", 0x0080: "z",
 }
+
+# Original Click v1: its two +/- buttons report on the classic D-pad bits
+# (older firmware) or as protobuf fields 1/2 of the 0x37 message (firmware
+# 1.1.0+).  The v2 shifter slots are also included (with the same left=
+# down / right=up side semantics) so pairs of Click v2 keep working when
+# their kind could not be classified.
+V1_DEFAULT_BIT_ACTIONS: dict[int, str] = {
+    0x0002: "up", 0x0008: "down",
+    0x0100: "down", 0x0200: "down",
+    0x1000: "up", 0x2000: "up",
+}
+
+
+def default_bit_actions(kind_id: int | None) -> dict[int, str]:
+    """Default keypad-bit -> logical mapping for this hardware generation."""
+    if kind_id is None or kind_id == 9:      # original Click (or unknown kind)
+        return dict(V1_DEFAULT_BIT_ACTIONS)
+    return dict(V2_DEFAULT_BIT_ACTIONS)
+
+
+def effective_bit_actions(kind_id: int | None,
+                          configured: dict[int, str] | None) -> dict[int, str]:
+    """Defaults + user's click_bits remap (user values win)."""
+    return {**default_bit_actions(kind_id), **(configured or {})}
 
 # Legacy (encrypted, Zwift Play era) protocol-buffer field numbers.
 PB_FIELD_NAMES = {
@@ -99,10 +143,18 @@ PB_FIELD_NAMES = {
 }
 PB_DEFAULT_FIELD_ACTIONS = {2: "up", 5: "down"}
 
+# Original Click v1 keypad message (0x37): protobuf with one field per
+# button (ClickKeyPadStatus: Button_Plus = 1, Button_Minus = 2); the
+# PlayButtonStatus enum is active-low -- value 0 (ON) means pressed.
+CLICK_PB_FIELD_NAMES = {1: "plus", 2: "minus"}
+CLICK_PB_DEFAULT_FIELD_ACTIONS = {1: "up", 2: "down"}
+
 MSG_KEYPAD_PB = 0x07  # Play-era protobuf keypad message
+MSG_KEYPAD_CLICK = 0x37  # original Click protobuf keypad message
 MSG_KEYPAD_SF2 = 0x23  # current-era keyed bitmap message
 MSG_IDLE_A = 0x15
 MSG_IDLE_B = 0x19
+MSG_LOG = 0x2A  # firmware log frames (e.g. "Batt. Volt. 2945 mV")
 
 PLAIN_ACK = b"RideOn"
 
@@ -140,6 +192,53 @@ def classify_advertisement(name: str | None, adv: AdvertisementData) -> dict | N
 ActionCallback = Callable[[str, bool, int], None]
 
 
+async def discover_controllers(timeout: float = 5.0) -> list[tuple[BLEDevice, AdvertisementData, dict]]:
+    """One scan; returns (device, adv, info) for every Zwift controller seen."""
+    results = await BleakScanner.discover(timeout=timeout, return_adv=True)
+    # bleak >= 1.0 returns {address: (device, adv)}; older returns a list.
+    pairs = list(results.values()) if isinstance(results, dict) else list(results)
+    out: list[tuple[BLEDevice, AdvertisementData, dict]] = []
+    for dev, adv in pairs:
+        info = classify_advertisement(dev.name, adv)
+        if info:
+            out.append((dev, adv, info))
+    return out
+
+
+async def disconnect_stale() -> None:
+    """Disconnect BlueZ-orphaned Zwift controllers.
+
+    BlueZ keeps a connection open after the controlling process dies.  A
+    connected controller never advertises, so such zombies must be dropped
+    before a restarted bridge can rediscover the hardware.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "bluetoothctl", "devices", "Connected",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await proc.communicate()
+    except Exception:
+        return
+    for line in out.decode(errors="replace").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 2:
+            continue
+        addr, name = parts[1], (parts[2] if len(parts) > 2 else "")
+        if not name.lower().startswith("zwift"):
+            continue
+        log.info("dropping stale BlueZ connection to %s (%s) ...", addr, name)
+        try:
+            killer = await asyncio.create_subprocess_exec(
+                "bluetoothctl", "disconnect", addr,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await killer.communicate()
+            await asyncio.sleep(0.2)
+        except Exception:
+            pass
+
+
 class ZwiftClick:
     """Connects to one Zwift controller and emits logical button events."""
 
@@ -147,6 +246,7 @@ class ZwiftClick:
         self,
         *,
         address: str | None = None,
+        kind_id: int | None = None,
         watch: bool = False,
         legacy_ecdh: bool = False,
         bit_actions: dict[int, str] | None = None,
@@ -159,8 +259,13 @@ class ZwiftClick:
         self.address = (address or "").strip() or None
         self.watch = watch
         self.legacy_ecdh = legacy_ecdh
-        self.bit_actions = {**DEFAULT_BIT_ACTIONS, **(bit_actions or {})}
+        self.kind_id = kind_id
+        self._bit_overrides = {**(bit_actions or {})}
+        self.bit_actions = effective_bit_actions(self.kind_id, self._bit_overrides)
         self.field_actions = {**PB_DEFAULT_FIELD_ACTIONS, **(field_actions or {})}
+        self._click_field_actions = {
+            **CLICK_PB_DEFAULT_FIELD_ACTIONS, **(field_actions or {}),
+        }
 
         self.on_action = on_action or (lambda *a, **k: None)
         self.on_ready = on_ready or (lambda *a, **k: None)
@@ -182,8 +287,9 @@ class ZwiftClick:
         self._crypto_pending = asyncio.Event()
         self._first_rx = asyncio.Event()
         self._last_rx = 0.0
-        self._bitmap_prev = 0
+        self._bitmap_prev = 0xFFFFFFFF
         self._active_pb: dict[tuple[int, int], bool] = {}
+        self._active_click_pb: dict[int, bool] = {}
         self._haptics_ok = True
         self._haptic_warned = False
         self._stop = False
@@ -289,8 +395,8 @@ class ZwiftClick:
                     log.debug("session ended: %r", exc)
             if self._stop:
                 break
+            was_connected = self.connected
             self.connected = False
-            self.on_gone()
             if self._client is not None:
                 try:
                     await self._client.disconnect()
@@ -298,26 +404,48 @@ class ZwiftClick:
                     pass
                 self._client = None
                 log.info("reconnecting ...")
+            else:
+                log.debug("connect attempt failed: retrying in %.1f s", retry)
+            # Only report a real session ending -- a failed scan (controller
+            # simply not advertising) must not spam the event journal with
+            # "controller disconnected".
+            if was_connected:
+                self.on_gone()
             await asyncio.sleep(retry)
             retry = min(retry * 2, 5.0)
 
-    async def _find_target(self) -> BLEDevice | None:
+    async def _find_target(self) -> tuple[BLEDevice, AdvertisementData] | None:
+        """Scan once and return (device, advertisement) or None."""
+        results = await BleakScanner.discover(timeout=5.0, return_adv=True)
+        # bleak >= 1.0 returns {address: (device, adv)}; older returns a list.
+        pairs = list(results.values()) if isinstance(results, dict) else list(results)
         if self.address:
-            for dev, adv in await BleakScanner.discover(timeout=5.0, return_adv=True):
+            for dev, adv in pairs:
                 if dev.address.upper() == self.address.upper():
                     self._log_candidate(dev, adv)
-                    return dev
+                    self._absorb_kind(adv)
+                    return dev, adv
             return None
-        best: tuple[int, BLEDevice, AdvertisementData] | None = None
-        for dev, adv in await BleakScanner.discover(timeout=5.0, return_adv=True):
+        best: tuple[int, BLEDevice, AdvertisementData, int | None] | None = None
+        for dev, adv in pairs:
             info = classify_advertisement(dev.name, adv)
             if not info:
                 continue
             self._log_candidate(dev, adv)
             pref = KIND_PREFERENCE.get(info["kind"], 3)
             if best is None or pref < best[0]:
-                best = (pref, dev, adv)
-        return best[1] if best else None
+                best = (pref, dev, adv, info["kind_id"])
+        if best is None:
+            return None
+        if best[3] is not None:
+            self.kind_id = best[3]
+        return (best[1], best[2])
+
+    def _absorb_kind(self, adv: AdvertisementData | None) -> None:
+        """Remember the advertised device kind (used for button defaults)."""
+        mfg = adv.manufacturer_data.get(ZWIFT_MFG_ID) if adv else None
+        if mfg and mfg[0] in DEVICE_KINDS:
+            self.kind_id = mfg[0]
 
     def _log_candidate(self, dev: BLEDevice, adv: AdvertisementData) -> None:
         if not self.watch:
@@ -328,20 +456,38 @@ class ZwiftClick:
                   (dev.name or "?").strip(), dev.address.upper(), kind,
                   ",".join(sorted(u[-8:] for u in adv.service_uuids)) or "-")
 
+    def _watch(self, msg: str) -> None:
+        if self.watch:
+            log.debug("click %s: %s", self.address, msg)
+
     # --------------------------------------------------------- connection
     async def _connect_once(self) -> bool:
-        log.info("searching for controller%s%s ...",
-                 "  " + self.device_label if self.device_label != "?" else "",
-                 f" [pinned {self.address}]" if self.address else "")
-        dev = await self._find_target()
-        if dev is None:
-            return False
-        mfg = dev.manufacturer_data.get(ZWIFT_MFG_ID)
-        kind_name = DEVICE_KINDS.get(mfg[0]) if mfg else None
-        self.device_label = f"{(dev.name or 'Zwift').strip()} ({kind_name or 'controller'})"
+        # Pinned instances connect straight to the address -- BlueZ keeps a
+        # cached device object, so no scan is needed.  Scanning synchronously
+        # from many instances at once starves the radio and trips D-Bus
+        # 'Operation already in progress' errors.
+        if self.address:
+            log.info("direct connect attempt to pinned %s ...", self.address)
+            dev, adv = None, None
+        else:
+            log.info("searching for controller ...")
+            found = await self._find_target()
+            if found is None:
+                return False
+            dev, adv = found
+        # bleak >= 1.0 moved advertisement data off BLEDevice.
+        self._absorb_kind(adv)
+        kind_name = DEVICE_KINDS.get(self.kind_id) if self.kind_id is not None else None
+        self.device_label = (
+            f"{((dev.name if dev else 'Zwift Click') or 'Zwift Click').strip()}"
+            f" ({kind_name or 'controller'})"
+        )
         log.info("found %s -- connecting ...", self.device_label)
 
-        client = BleakClient(dev, timeout=15.0)
+        if dev is None:
+            client = BleakClient(self.address, timeout=15.0)
+        else:
+            client = BleakClient(dev, timeout=15.0)
         await client.connect()
         self._client = client
         try:
@@ -368,9 +514,12 @@ class ZwiftClick:
         self._crypto_pending = asyncio.Event()
         self._first_rx = asyncio.Event()
         self._last_rx = time.monotonic()
-        self._bitmap_prev = 0
+        self._bitmap_prev = 0xFFFFFFFF
         self._active_pb.clear()
+        self._active_click_pb.clear()
         self._haptics_ok = True
+        # the device kind may only be known now (from this scan/round):
+        self.bit_actions = effective_bit_actions(self.kind_id, self._bit_overrides)
 
         await client.start_notify(self._char_measure, self._on_measure)
         await client.start_notify(self._char_response, self._on_response)
@@ -556,7 +705,9 @@ class ZwiftClick:
                 self.protocol = "plain"
             return
         if first == MSG_KEYPAD_SF2:
-            bitmap, _ = read_varint(payload, 1)
+            # payload[0] is the 0x23 type, payload[1] the protobuf field-1
+            # tag (0x08); the bitmap varint starts at offset 2.
+            bitmap, _ = read_varint(payload, 2)
             if self.protocol is None:
                 self.protocol = "plain"
             self._emit_bitmap(bitmap)
@@ -566,10 +717,19 @@ class ZwiftClick:
                 self.protocol = "plain-legacy-pb"
             self._emit_play_pb(payload[1:])
             return
+        if first == MSG_KEYPAD_CLICK:
+            if self.protocol is None:
+                self.protocol = "plain-click-pb"
+            self._emit_click_pb(payload[1:])
+            return
+        if first in (MSG_LOG, 0xFF):  # 0x2A = firmware log ("Batt. Volt."), 0xFF = device info
+            self._watch(f"device log frame: {payload.hex()}")
+            return
         self._watch(f"unknown payload: {payload.hex()}")
 
     def _dispatch_bit(self, bit: int, pressed: bool) -> None:
-        name = BIT_NAMES.get(bit, f"bit{bit}")
+        """bit carries the keypad bitmap *value* (0x1, 0x2, 0x4, 0x8, ...)."""
+        name = BIT_NAMES.get(bit, f"bit0x{bit:x}")
         action = self.bit_actions.get(bit)
         if action is None:
             if pressed or self.watch:
@@ -578,14 +738,45 @@ class ZwiftClick:
         self.on_action(action, pressed, bit)
 
     def _emit_bitmap(self, bitmap: int) -> None:
+        bitmap &= 0xFFFFFFFF
+        if bitmap == self._bitmap_prev:
+            return
+        self._watch(f"keypad bitmap {bitmap:08x}")
         pressed = (~bitmap) & 0xFFFFFFFF
-        newly = pressed & ~self._bitmap_prev
-        released = (~pressed) & self._bitmap_prev & 0xFFFFFFFF
-        self._bitmap_prev = pressed
-        for bit in bits_of(newly):
-            self._dispatch_bit(bit, True)
-        for bit in bits_of(released):
-            self._dispatch_bit(bit, False)
+        prev_pressed = (~self._bitmap_prev) & 0xFFFFFFFF
+        newly = pressed & ~prev_pressed
+        released = ~pressed & prev_pressed
+        self._bitmap_prev = bitmap
+        for idx in bits_of(newly):
+            self._dispatch_bit(1 << idx, True)
+        for idx in bits_of(released):
+            self._dispatch_bit(1 << idx, False)
+
+    def _emit_click_pb(self, body: bytes) -> None:
+        """Original Click keypad message (0x37): Button_Plus = 1, Button_Minus
+        = 2, active-low (0 == pressed)."""
+        i = 0
+        fields: dict[int, int] = {}
+        while i < len(body):
+            tag = body[i]
+            i += 1
+            field = tag >> 3
+            value, i = read_varint(body, i)
+            fields[field] = value
+        for field, value in sorted(fields.items()):
+            if field not in (1, 2):
+                self._watch(f"click pb field {field} = {value}")
+                continue
+            pressed = value == 0
+            if self._active_click_pb.get(field, False) == pressed:
+                continue
+            self._active_click_pb[field] = pressed
+            action = self._click_field_actions.get(field)
+            name = CLICK_PB_FIELD_NAMES.get(field, f"field{field}")
+            if action is None:
+                self._watch(f"key {name} {'pressed' if pressed else 'released'} (no mapping configured)")
+                continue
+            self.on_action(action, pressed, field)
 
     def _emit_play_pb(self, body: bytes) -> None:
         i = 0
