@@ -55,6 +55,9 @@ this very PC.
    * Bridge → systemd unit `clickbridge` (logs: `journalctl -u clickbridge -f`)
    * Panel → Apache vhost **http://clickbridge.local** (alias `zwiftclickpair.local`),
      published on the LAN via the `clickbridge-alias` unit (`avahi-publish`).
+     No .local support on the client? The same panel is the port default at
+     **http://\<Pi-IP\>:8090** — so it coexists with other Apache vhosts
+     (e.g. `mywhooshgarminsync.local` keeps http://\<Pi-IP\>:80 on this box).
      If you skip step 2 on a non-Apache box: `./run_clickbridge.sh` in one terminal and
      `./run_panel.sh` for the `php artisan serve` panel at `http://localhost:8080`.
 4. Firewall: Debian ships with no filtering enabled by default. If you run `ufw`:
