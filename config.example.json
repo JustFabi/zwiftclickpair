@@ -16,6 +16,7 @@
     "z": {"actions": ["brake"], "long_press": []}
   },
   "long_press_ms": 800,
+  "auto_release_s": 30,
   "haptics": true,
   "click_bits": {},
   "click_fields": {},

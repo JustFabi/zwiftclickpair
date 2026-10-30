@@ -34,6 +34,7 @@ log = logging.getLogger("obc")
 
 AppInfoCallback = Callable[[str, str, list[int]], None]
 HapticCallback = Callable[[int, int, int], None]
+SessionsCallback = Callable[[int], None]  # session set size changed
 
 
 def candidate_ips(only: str | None = None) -> list[str]:
@@ -180,6 +181,7 @@ class ObcServer:
         advertise: bool = True,
         on_app_info: AppInfoCallback | None = None,
         on_haptic: HapticCallback | None = None,
+        on_sessions: SessionsCallback | None = None,
     ):
         self.port = port
         self.name = name
@@ -187,6 +189,7 @@ class ObcServer:
         self.advertise = advertise
         self.on_app_info_cb = on_app_info or (lambda *a, **k: None)
         self.on_haptic_cb = on_haptic or (lambda *a, **k: None)
+        self.on_sessions_cb = on_sessions or (lambda n: None)
 
         self._server: asyncio.AbstractServer | None = None
         self._aiozc: AsyncZeroconf | None = None
@@ -311,6 +314,7 @@ class ObcServer:
             return
         session = ClientSession(reader, writer, self.on_app_info_cb, self.on_haptic_cb)
         self.sessions.add(session)
+        self.on_sessions_cb(len(self.sessions))
         asyncio.create_task(self._serve(session), name="obc-session")
 
     async def _serve(self, session: ClientSession) -> None:
@@ -319,6 +323,7 @@ class ObcServer:
             await session.serve()
         finally:
             self.sessions.discard(session)
+            self.on_sessions_cb(len(self.sessions))
 
     # ------------------------------------------------------------ emitting
     async def push_status(self, session: ClientSession | None = None) -> None:

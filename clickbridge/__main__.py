@@ -69,6 +69,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "addresses": [],
     # Safety cap for automatic discovery.
     "max_clicks": 4,
+    # Release the Clicks (drop their BLE sessions, stop reconnecting) this
+    # many seconds after the last trainer-app session closes.  The pods only
+    # power down when no host holds them, so this lets them sleep and saves
+    # battery between rides; they re-pair automatically when an app connects
+    # again (a sleeping pod may need one button press to wake + advertise).
+    # 0 = never release (legacy behaviour: hold them forever).
+    "auto_release_s": 30,
     "long_press_ms": 800,
     # Forward app haptic requests to the Click's vibration motor.
     "haptics": True,
@@ -232,11 +239,16 @@ class Bridge:
             advertise=not bool(cfg.get("no_mdns")),
             on_app_info=self._on_app_info,
             on_haptic=self._on_haptic,
+            on_sessions=self._on_sessions_changed,
         )
         self._click: MockClick | None = None          # mock mode only
         self._clicks: dict[str, ZwiftClick] = {}      # real controllers, by address
         self._click_tasks: dict[str, asyncio.Task] = {}
         self.max_clicks = max(1, int(cfg.get("max_clicks", 4) or 4))
+        self.auto_release_s = max(0.0, float(cfg.get("auto_release_s", 30) or 0))
+        self._sessions_live = False   # any trainer-app TCP session open?
+        self._closing = False
+        self._app_release_task: asyncio.Task | None = None
         self.addresses = [a.upper() for a in (cfg.get("addresses") or []) if str(a).strip()]
         self._active: set[int] = set()
         self._press_at: dict[str, float] = {}
@@ -298,6 +310,11 @@ class Bridge:
             on_battery=partial(self._on_click_battery, unit),
         )
         self._clicks[address] = click
+        # inherit the current app-session lease: a controller discovered
+        # *while* an app session is live must start scanning right away,
+        # not wait for the next session open/close event.
+        if self._sessions_live:
+            click.set_app_gate(True)
         log.info("new controller candidate %s (%s) -- pairing ...", address, unit)
         self.record("click", f"controller seen ({unit}) -- pairing ...")
         self._click_tasks[address] = asyncio.create_task(
@@ -425,6 +442,57 @@ class Bridge:
         if self._click is not None:
             self._click.request_haptic(zwift_pattern)
 
+    # ------------------------------------------- lease on app sessions
+    def _on_sessions_changed(self, count: int) -> None:
+        """ObcServer hook fired on every trainer-app TCP open/close."""
+        if self._closing:
+            return
+        if count > 0 and not self._sessions_live:
+            self._sessions_live = True
+            task, self._app_release_task = self._app_release_task, None
+            if task is not None:
+                task.cancel()
+            log.info("app session open -- controllers stay connected")
+            self.record("app", "app session open -- clicks stay connected")
+            for click in self._clicks.values():
+                click.set_app_gate(True)
+            asyncio.create_task(self.server.push_status())
+        elif count == 0 and self._sessions_live:
+            self._sessions_live = False
+            log.info("last app session closed")
+            self.record("app", "app session closed")
+            asyncio.create_task(self.server.push_status())
+        if (count == 0 and self.auto_release_s > 0
+                and self._app_release_task is None
+                and any(click.app_gate_open for click in self._clicks.values())):
+            self._app_release_task = asyncio.create_task(
+                self._release_clicks_later(), name="app-release-timer")
+
+    async def _release_clicks_later(self) -> None:
+        """Grace period, then drop the Clicks if still no app session."""
+        try:
+            await asyncio.sleep(self.auto_release_s)
+        except asyncio.CancelledError:
+            return  # an app came back in time (or shutdown)
+        self._app_release_task = None
+        if self._sessions_live or self._closing:
+            return
+        released = [c for c in self._clicks.values() if c.app_gate_open]
+        if not released:
+            return
+        self.record("control",
+                    f"no trainer app for {int(self.auto_release_s)} s -- "
+                    "releasing clicks so they can power down")
+        log.info("no trainer app for %.0f s -- releasing %d controller(s) "
+                 "so they can power down", self.auto_release_s, len(released))
+        for click in released:
+            click.set_app_gate(False)
+        for click in list(self._clicks.values()):
+            try:
+                await click.disconnect()
+            except Exception:
+                pass
+
     # ------------------------------------------------- control panel hooks
     async def set_pairing(self, enabled: bool) -> None:
         """Operator switch: enable/disable automatic pairing on BOTH sides.
@@ -457,8 +525,16 @@ class Bridge:
         self.server.pairing_enabled = enabled
 
     async def drop_all(self) -> None:
-        """Kick the Click and every connected trainer app on request."""
+        """Kick the Click and every connected trainer app on request.
+
+        The Clicks stay released (gates closed) until the next app session
+        opens -- the operator asked for a full drop, so auto-reconnect only
+        resumes once MyWhoosh (or any OBC app) holds a session again.
+        """
         self.record("control", "operator requested disconnect (Click + apps)")
+        self._sessions_live = False
+        for click in self._clicks.values():
+            click.set_app_gate(False)
         click = self._click
         if click is not None and hasattr(click, "disconnect"):
             try:
@@ -541,6 +617,7 @@ class Bridge:
                 "host": cfg.get("host"),
                 "haptics": bool(cfg.get("haptics", True)),
                 "long_press_ms": self.long_press_ms,
+                "auto_release_s": self.auto_release_s,
                 "buttons": buttons_pretty,
             },
             "events": list(self._events),
@@ -552,8 +629,10 @@ class Bridge:
 
         Pinned addresses (config 'addresses') are spawned immediately; in
         automatic mode every newly discovered controller joins up to
-        'max_clicks'.  Existing sessions keep running while pairing is
-        paused (control panel switch), new ones just stop appearing.
+        'max_clicks'.  Between trainer-app sessions the Clicks stay released
+        (auto-release lease), so discovery only scans while an app holds a
+        session.  Existing sessions keep running while pairing is paused
+        (control panel switch), new ones just stop appearing.
         """
         from .clickdevice import discover_controllers
 
@@ -565,7 +644,7 @@ class Bridge:
             await asyncio.sleep(2.0)  # stagger direct connects
         while not self._stopped.is_set():
             clicks = list(self._clicks.values())
-            if (self.pairing_enabled and not self.addresses
+            if (self._sessions_live and self.pairing_enabled and not self.addresses
                     and (not clicks or any(not c.connected for c in clicks))):
                 # A connected controller never advertises; scanning while all
                 # managed clicks hold sessions only burns radio + D-Bus time
@@ -613,6 +692,10 @@ class Bridge:
 
     async def _teardown(self, click_task, status_task) -> None:
         suppress = contextlib.suppress
+        self._closing = True
+        if self._app_release_task is not None:
+            self._app_release_task.cancel()
+            self._app_release_task = None
         if self.control_api is not None:
             with suppress(Exception):
                 self.control_api.stop()
@@ -805,6 +888,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="try the legacy encrypted controller handshake")
     p.add_argument("--haptic-off", action="store_true", help="disable haptics")
     p.add_argument("--long-press-ms", type=int, help="long-press threshold")
+    p.add_argument("--auto-release-s", type=float, metavar="SEC",
+                   help="release the Clicks this many seconds after the last "
+                        "trainer-app session closes so they can power down "
+                        "(default 30, 0 = keep holding them)")
     p.add_argument("--mock", action="store_true",
                    help="simulate the Click (keyboard: u/d/p/b, q quits)")
     p.add_argument("--mock-period", type=float, metavar="SEC",
@@ -836,6 +923,7 @@ def main(argv: list[str] | None = None) -> int:
         "legacy_ecdh": True if args.legacy_ecdh else None,
         "haptics": False if args.haptic_off else None,
         "long_press_ms": args.long_press_ms,
+        "auto_release_s": args.auto_release_s,
     }
     cfg = load_config(args.config, overrides)
 

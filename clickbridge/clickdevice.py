@@ -297,6 +297,14 @@ class ZwiftClick:
         # automatic pairing gate: cleared = stop scanning/connecting
         self._pairing = asyncio.Event()
         self._pairing.set()
+        # app-session gate: cleared = no trainer app is currently using the
+        # bridge, so the run loop releases this controller (drops the session
+        # and stops reconnecting) until an app appears again.  The pods only
+        # power down when no host holds them -- releasing them between rides
+        # is what lets them sleep instead of draining their batteries.
+        # Starts CLEARED: pair only once an app session shows up (apps like
+        # MyWhoosh re-open theirs automatically right after a bridge restart).
+        self._app_gate = asyncio.Event()
 
     # ------------------------------------------------------------------ API
     def start(self) -> asyncio.Task:
@@ -330,6 +338,17 @@ class ZwiftClick:
     def pairing_enabled(self) -> bool:
         return self._pairing.is_set()
 
+    def set_app_gate(self, allowed: bool) -> None:
+        """Open/close the app-session lease (set by the orchestrator)."""
+        if allowed:
+            self._app_gate.set()
+        else:
+            self._app_gate.clear()
+
+    @property
+    def app_gate_open(self) -> bool:
+        return self._app_gate.is_set()
+
     async def disconnect(self) -> None:
         """Drop the current BLE session on request (run loop reconnects)."""
         if self._client is not None:
@@ -362,7 +381,36 @@ class ZwiftClick:
     async def _run_loop(self) -> None:
         retry = 1.0
         paused = False
+        idle = False
         while not self._stop:
+            if not self._app_gate.is_set():
+                # No trainer app session is using the bridge: drop the
+                # current BLE session (if any) and do not scan or reconnect
+                # until an app appears -- that is what lets the controller
+                # power down instead of sitting connected forever.
+                was_connected = self.connected
+                self.connected = False
+                if self._client is not None:
+                    try:
+                        await self._client.disconnect()
+                    except Exception:
+                        pass
+                    self._client = None
+                if was_connected:
+                    log.info("%s released -- no app session using the bridge",
+                             self.device_label)
+                    self.on_gone()
+                if not idle:
+                    idle = True
+                    log.info("no app session using the bridge -- waiting for "
+                             "an app before connecting (controller will be "
+                             "able to power down)")
+                await asyncio.sleep(0.5)
+                continue
+            if idle:
+                log.info("app session detected -- searching for controllers again")
+                idle = False
+                retry = 1.0
             if not self._pairing.is_set():
                 # automatic pairing paused by the operator (control panel):
                 # an already-open session keeps running, but we do not scan

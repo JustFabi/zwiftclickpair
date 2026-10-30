@@ -90,8 +90,15 @@ What you get:
   working. **ON** resumes scanning + advertising. (Also on `POST /api/pairing`.)
 * Live status: Click connection state, battery bar, connected trainer apps, mDNS state, mapping.
 * **Event journal** — last 200 events, refreshed ~1.5 s (shift presses, app connects, battery, …).
-* **Disconnect everything** button (drops the Click and all app sessions; auto-pairing
-  reconnects afterwards unless pairing is paused).
+* **Disconnect everything** button (drops the Click and all app sessions; pairing
+  resumes automatically the next time a trainer app opens a session).
+
+Battery-saving auto-release: the Click pods only power down when no host keeps a
+connection. ClickBridge therefore releases them `auto_release_s` (default 30) seconds
+after the last trainer-app session closes — they sleep, and re-pair automatically the
+next time MyWhoosh (or any OpenBikeControl app) connects. A pod that went asleep may
+need one button press to wake and advertise; the bridge pairs it again the moment it
+shows up. Between sessions the bridge also stops scanning (silent BLE radio).
 
 Security model: the Python control API binds to **127.0.0.1 only** — nothing else on the
 network can reach it. Browsers go through the Laravel app (standard CSRF protection) at
@@ -132,6 +139,7 @@ Default settings live in memory; **config.json** (created by `--save-config`) ov
 | `buttons`      | per-physical-button mapping (see below)                             |
 | `long_press_ms`| threshold for the long-press gesture (default 800)                  |
 | `haptics`      | forward app vibration requests to the Click                        |
+| `auto_release_s`| release the Clicks this many seconds after the last trainer-app session closes so they can power down (default `30`, `0` = hold forever) |
 | `click_bits`   | remap keypad bitmap bits (VALUES: 2, 8, 256, 4096 …) → logical, if your firmware differs |
 | `legacy_ecdh`  | use the encrypted legacy handshake (very old firmware)              |
 | `watch`        | raw-frames diagnostics                                             |
