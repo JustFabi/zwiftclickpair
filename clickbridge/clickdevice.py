@@ -775,30 +775,63 @@ class ZwiftClick:
             return
         self._watch(f"unknown payload: {payload.hex()}")
 
-    def _dispatch_bit(self, bit: int, pressed: bool) -> None:
-        """bit carries the keypad bitmap *value* (0x1, 0x2, 0x4, 0x8, ...)."""
-        name = BIT_NAMES.get(bit, f"bit0x{bit:x}")
-        action = self.bit_actions.get(bit)
-        if action is None:
-            if pressed or self.watch:
-                self._watch(f"key {name} {'pressed' if pressed else 'released'} (no mapping configured)")
-            return
-        self.on_action(action, pressed, bit)
-
     def _emit_bitmap(self, bitmap: int) -> None:
+        """Emit logical press/release edges from a keypad bitmap frame.
+
+        Each shifter has TWO wire contacts (primary + second position) that
+        map to the same logical button (V2_DEFAULT_BIT_ACTIONS above).  The
+        down-set of *logical buttons* is therefore the only meaningful state,
+        and edges are diffed between down-sets -- never between wire bits:
+
+          * A frame that swaps contacts (stage-1 releases while stage-2
+            presses in the same notification) is the button still being
+            held.  Per-bit edges would emit release-then-press (or, with
+            press-first ordering, press-then-release) for the SAME logical
+            button, which the orchestrator dedup then eats -- whole inputs
+            disappeared whenever a fast press rolled between contacts.
+          * A logical button can never emit a press AND a release in one
+            frame, so no zero-length press pulses reach the app.
+          * Releases fire before presses so a freed logical state is seen by
+            the app before a new one arms (matters when two different
+            buttons change in one frame).
+        """
         bitmap &= 0xFFFFFFFF
         if bitmap == self._bitmap_prev:
             return
         self._watch(f"keypad bitmap {bitmap:08x}")
         pressed = (~bitmap) & 0xFFFFFFFF
         prev_pressed = (~self._bitmap_prev) & 0xFFFFFFFF
-        newly = pressed & ~prev_pressed
-        released = ~pressed & prev_pressed
         self._bitmap_prev = bitmap
-        for idx in bits_of(newly):
-            self._dispatch_bit(1 << idx, True)
-        for idx in bits_of(released):
-            self._dispatch_bit(1 << idx, False)
+
+        before = self._logical_down(prev_pressed)
+        after = self._logical_down(pressed)
+
+        # wire bits that toggled without a logical mapping: diagnostics only
+        for idx in bits_of(pressed ^ prev_pressed):
+            bit = 1 << idx
+            if bit not in self.bit_actions:
+                self._watch(f"key bit{bit:x} "
+                            f"{'pressed' if bit & pressed else 'released'}"
+                            " (unmapped)")
+
+        for name in sorted(before.keys() - after.keys()):
+            self.on_action(name, False, before[name])
+        for name in sorted(after.keys() - before.keys()):
+            self.on_action(name, True, after[name])
+
+    def _logical_down(self, pressed_bits: int) -> dict[str, int]:
+        """Set of logical buttons that are down; mapped from wire bits.
+
+        Returns {logical name: contributing wire bit} -- the bit is passed
+        as the `source` argument of on_action (purely informational).
+        """
+        down: dict[str, int] = {}
+        for idx in bits_of(pressed_bits & 0xFFFFFFFF):
+            bit = 1 << idx
+            name = self.bit_actions.get(bit)
+            if name is not None and name not in down:
+                down[name] = bit
+        return down
 
     def _emit_click_pb(self, body: bytes) -> None:
         """Original Click keypad message (0x37): Button_Plus = 1, Button_Minus
